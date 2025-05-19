@@ -1,0 +1,97 @@
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.layers import Input, Dense
+from tensorflow.keras.models import Model
+from sklearn.cluster import KMeans
+from sklearn.metrics import accuracy_score
+from tensorflow.keras.optimizers import Adam
+
+# 1. Autoencoder definition
+def build_autoencoder(input_dim, encoding_dim):
+    input_layer = Input(shape=(input_dim,))
+    encoded = Dense(500, activation='relu')(input_layer)
+    encoded = Dense(500, activation='relu')(encoded)
+    encoded = Dense(2000, activation='relu')(encoded)
+    encoded_output = Dense(encoding_dim, activation='relu')(encoded)
+
+    decoded = Dense(2000, activation='relu')(encoded_output)
+    decoded = Dense(500, activation='relu')(decoded)
+    decoded = Dense(500, activation='relu')(decoded)
+    output_layer = Dense(input_dim, activation='sigmoid')(decoded)
+
+    autoencoder = Model(inputs=input_layer, outputs=output_layer)
+    encoder = Model(inputs=input_layer, outputs=encoded_output)
+    return autoencoder, encoder
+
+# 2. Custom clustering layer (soft assignment)
+class ClusteringLayer(tf.keras.layers.Layer):
+    def __init__(self, n_clusters, latent_dim, **kwargs):
+        super(ClusteringLayer, self).__init__(**kwargs)
+        self.n_clusters = n_clusters
+        self.latent_dim = latent_dim
+
+    def build(self, input_shape):
+        self.cluster_centers = self.add_weight(
+            shape=(self.n_clusters, self.latent_dim),
+            initializer='glorot_uniform',
+            trainable=True
+        )
+
+    def call(self, inputs):
+        q = 1.0 / (1.0 + (tf.reduce_sum(tf.square(tf.expand_dims(inputs, axis=1) - self.cluster_centers), axis=2)))
+        q **= (self.latent_dim + 1.0) / 2.0
+        q = tf.transpose(tf.transpose(q) / tf.reduce_sum(q, axis=1))
+        return q
+
+# 3. Target distribution
+def target_distribution(q):
+    weight = q ** 2 / tf.reduce_sum(q, axis=0)
+    return tf.transpose(tf.transpose(weight) / tf.reduce_sum(weight, axis=1))
+
+# 4. Training loop
+def train_dec(x, encoder, autoencoder, n_clusters=10, latent_dim=10, maxiter=10000, update_interval=140, batch_size=256):
+
+    # Initialize cluster centers with KMeans
+    latent = encoder.predict(x)
+    kmeans = KMeans(n_clusters=n_clusters, n_init=20)
+    y_pred = kmeans.fit_predict(latent)
+
+    clustering_layer = ClusteringLayer(n_clusters, latent_dim)(encoder.output)
+    model = Model(inputs=encoder.input, outputs=[clustering_layer, autoencoder.output])
+    model.compile(loss=['kld', 'mse'], loss_weights=[1, 0.1], optimizer=Adam())
+
+    # Set initial cluster centers
+    model.get_layer(index=-2).set_weights([kmeans.cluster_centers_])
+
+    for ite in range(maxiter):
+        if ite % update_interval == 0:
+            q, _ = model.predict(x, verbose=0)
+            p = target_distribution(q)
+
+        idx = np.random.choice(x.shape[0], batch_size, replace=False)
+        x_batch = x[idx]
+        p_batch = p[idx]
+
+        loss = model.train_on_batch(x_batch, [p_batch, x_batch])
+        if ite % 1000 == 0:
+            print(f"Iter {ite}, loss: {loss}")
+
+    return model
+
+# Example usage
+from sklearn.datasets import load_digits
+from sklearn.preprocessing import MinMaxScaler
+
+digits = load_digits()
+x = digits.data
+x = MinMaxScaler().fit_transform(x)
+
+input_dim = x.shape[1]
+encoding_dim = 10
+n_clusters = 10
+
+autoencoder, encoder = build_autoencoder(input_dim, encoding_dim)
+autoencoder.compile(optimizer='adam', loss='mse')
+autoencoder.fit(x, x, batch_size=256, epochs=50, verbose=1)
+
+dec_model = train_dec(x, encoder, autoencoder, n_clusters=n_clusters, latent_dim=encoding_dim)
